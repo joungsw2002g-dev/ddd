@@ -619,7 +619,6 @@ def load_or_prepare(refresh_cache: bool) -> tuple[SimulationInputs, list[StockFe
     return market, features, overbought, neutral, kospi_close
 
 
-
 def period_rows(
     base: dict[str, object],
     equity: pd.Series,
@@ -655,6 +654,7 @@ def period_rows(
         })
     return rows
 
+
 def score_result(row: dict[str, object]) -> float:
     cagr = float(row["cagr"])
     mdd = abs(float(row["mdd"]))
@@ -662,7 +662,6 @@ def score_result(row: dict[str, object]) -> float:
     filled = int(row["filled"])
     exposure = float(row["exposure"])
     return cagr * 100 + trade_pf * 2 + min(filled, 200) / 100 - mdd * 10 - exposure
-
 
 
 def slice_market_and_features(
@@ -762,6 +761,7 @@ def independent_period_rows(
                 "pass_alpha_gate": metrics["cagr"] > 0 and metrics["trade_pf"] > 1.2 and metrics["t_exposure_matched"] > 1.0,
             })
     return rows
+
 
 def main() -> None:
     started = perf_counter()
