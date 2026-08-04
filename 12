@@ -1,3 +1,4 @@
+print("SeedForge 001 파일 실행 시작", flush=True)
 """RSI 3저점 다이버전스 백테스트 (거래 원장/시간축 수정판).
 
 핵심 변경점
@@ -10,14 +11,29 @@
 ``load_data``에서 마지막 가격에 그 수익률을 반영해야 한다.
 """
 
-from __future__ import annotations
-
 print("SeedForge 001 모듈 로딩 중...", flush=True)
 
+import importlib.util
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable
+
+
+def ensure_dependencies() -> None:
+    missing = [name for name in ("numpy", "pandas", "pyarrow") if importlib.util.find_spec(name) is None]
+    if not missing:
+        return
+    packages = " ".join(missing)
+    print("\n필수 패키지가 현재 Python 환경에 없습니다:", ", ".join(missing), flush=True)
+    print("아래 명령을 같은 창에서 실행한 뒤 다시 시도하세요:", flush=True)
+    print(f"  {sys.executable} -m pip install {packages}", flush=True)
+    print("가상환경을 쓰는 경우 먼저 venv\\Scripts\\activate를 실행하세요.", flush=True)
+    raise SystemExit(1)
+
+
+ensure_dependencies()
 
 import numpy as np
 import pandas as pd
