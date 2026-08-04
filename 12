@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+print("SeedForge 001 모듈 로딩 중...", flush=True)
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -367,7 +369,14 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     files = sorted((D / "ohlcv").glob("*.parquet"))
     if not files:
         raise FileNotFoundError("data/ohlcv에 parquet 파일이 없습니다")
-    frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
+    print(f"OHLCV parquet {len(files):,}개 읽는 중...", flush=True)
+    frames = []
+    for number, path in enumerate(files, 1):
+        frames.append(pd.read_parquet(path))
+        if number == 1 or number % 10 == 0 or number == len(files):
+            print(f"  - {number:,}/{len(files):,} 파일 로드 완료: {path.name}", flush=True)
+    print("OHLCV 병합 중...", flush=True)
+    frame = pd.concat(frames, ignore_index=True)
     frame["date"] = pd.to_datetime(frame["date"])
     frame = frame[frame["date"] >= FLOOR]
     for column in ("시가", "고가", "저가", "종가"):
@@ -412,6 +421,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     kospi_file = D / "index" / "KOSPI.parquet"
     if not kospi_file.exists():
         raise FileNotFoundError("data/index/KOSPI.parquet가 없습니다")
+    print("KOSPI parquet 읽는 중...", flush=True)
     kospi = pd.read_parquet(kospi_file)
     kospi["date"] = pd.to_datetime(kospi["date"])
     column = "종가" if "종가" in kospi else kospi.columns[-1]
@@ -526,16 +536,18 @@ def run_one(
 
 def main() -> None:
     started = perf_counter()
+    print("SeedForge 001 RSI 다이버전스 백테스트 시작", flush=True)
     close, open_, volume, entry_eligible, kospi_close = load_data()
-    print(f"{len(close):,}일 × {close.shape[1]:,}종목")
-    print("공통 지표·피봇 계산 (전체 실행에서 1회)...")
+    print(f"{len(close):,}일 × {close.shape[1]:,}종목", flush=True)
+    print("공통 지표·피봇 계산 (전체 실행에서 1회)...", flush=True)
     market = prepare_market(close, open_, entry_eligible)
     features, overbought, neutral = prepare_features(close, volume, kospi_close)
     print(
         f"대상 {len(features):,}종목, 전처리 {perf_counter() - started:.1f}초, "
-        "조합별 신호/시뮬레이션 시작"
+        "조합별 신호/시뮬레이션 시작",
+        flush=True,
     )
-    print("RSI 대기 거래량 RS  CAGR    MDD    노출   t(노출조정) 승률  손익비 거래PF 거래수 놓침")
+    print("RSI 대기 거래량 RS  CAGR    MDD    노출   t(노출조정) 승률  손익비 거래PF 거래수 놓침", flush=True)
     output = D / "results"
     output.mkdir(parents=True, exist_ok=True)
     combination = 0
@@ -572,9 +584,10 @@ def main() -> None:
                         f"{metrics['exposure']:>6.1%} {metrics['t_exposure_matched']:>10.2f} "
                         f"{metrics['win_rate']:>5.1%} {metrics['payoff']:>6.2f} "
                         f"{metrics['trade_pf']:>6.2f} {counts['filled']:>5} {missed:>5.0%} "
-                        f"{perf_counter() - combination_started:>5.1f}초"
+                        f"{perf_counter() - combination_started:>5.1f}초",
+                        flush=True,
                     )
-    print(f"전체 실행시간 {perf_counter() - started:.1f}초")
+    print(f"전체 실행시간 {perf_counter() - started:.1f}초", flush=True)
 
 
 if __name__ == "__main__":
