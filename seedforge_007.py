@@ -1,4 +1,4 @@
-print("SeedForge 006 파일 실행 시작", flush=True)
+print("SeedForge 007 파일 실행 시작", flush=True)
 """RSI 3저점 다이버전스 백테스트 (거래 원장/시간축 수정판).
 
 핵심 변경점
@@ -11,7 +11,7 @@ print("SeedForge 006 파일 실행 시작", flush=True)
 ``load_data``에서 마지막 가격에 그 수익률을 반영해야 한다.
 """
 
-print("SeedForge 006 모듈 로딩 중...", flush=True)
+print("SeedForge 007 모듈 로딩 중...", flush=True)
 
 import importlib.util
 import pickle
@@ -41,7 +41,7 @@ import pandas as pd
 
 
 D = Path("./data")
-CACHE = D / "cache" / "seedforge_006_prepared.pkl"
+CACHE = D / "cache" / "seedforge_007_prepared.pkl"
 PERIODS = (
     ("2014_2017", "2014-05-12", "2017-12-31"),
     ("2018_2020", "2018-01-01", "2020-12-31"),
@@ -249,6 +249,7 @@ def simulate(
     overbought_signals: dict[int, set[int]],
     neutral_signals: dict[int, set[int]],
     stop_loss: float | None = None,
+    stop_cooldown_days: int = 0,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame, dict[str, int]]:
     """신호 다음 날 시가 체결. 원장 순손익과 현금 변화가 같은 회계에 속한다."""
     dates, tickers = market.dates, market.tickers
@@ -256,6 +257,7 @@ def simulate(
     marked_close_values = market.marked_close
     eligible_values = market.entry_eligible
     cash, positions = INITIAL_CAPITAL, {}
+    cooldown_until: dict[int, int] = {}
     trades: list[dict[str, object]] = []
     equity, exposure = [], []
     signal_count = filled_count = skipped_count = 0
@@ -315,6 +317,8 @@ def simulate(
             if closed:
                 trades.append(_close_trade(position))
                 del positions[j]
+                if reason == "price_stop" and stop_cooldown_days > 0:
+                    cooldown_until[j] = i + stop_cooldown_days
 
         candidates = buys_at.get(i, [])
         signal_count += len(candidates)
@@ -322,6 +326,7 @@ def simulate(
             opening = open_values[i, j]
             if (
                 j in positions
+                or i < cooldown_until.get(j, -1)
                 or not eligible_values[i, j]
                 or not (np.isfinite(opening) and opening > 0)
             ):
@@ -574,6 +579,7 @@ def run_one(
     volume_factor: float,
     use_relative_strength: bool,
     stop_loss: float | None = None,
+    stop_cooldown_days: int = 0,
 ) -> tuple[dict[str, float], pd.DataFrame, pd.Series, pd.Series, dict[str, int]]:
     buys: dict[int, list[tuple[int, float]]] = {}
 
@@ -593,7 +599,9 @@ def run_one(
         for day, score in buy:
             buys.setdefault(day, []).append((stock.column, score))
 
-    equity, exposure, trades, counts = simulate(market, buys, overbought, neutral, stop_loss)
+    equity, exposure, trades, counts = simulate(
+        market, buys, overbought, neutral, stop_loss, stop_cooldown_days
+    )
     benchmark_return = kospi_close.pct_change(fill_method=None).fillna(0)
     metrics = performance(equity, exposure, benchmark_return, trades)
     return metrics, trades, equity, exposure, counts
@@ -746,6 +754,7 @@ def independent_period_rows(
                 float(selected.volume_factor),
                 bool(selected.use_relative_strength),
                 None if pd.isna(selected.stop_loss) else float(selected.stop_loss),
+                int(getattr(selected, "stop_cooldown_days", 0)),
             )
             rows.append({
                 "rank_full": rank,
@@ -756,6 +765,9 @@ def independent_period_rows(
                 "confirm_days": int(selected.confirm_days),
                 "volume_factor": float(selected.volume_factor),
                 "use_relative_strength": bool(selected.use_relative_strength),
+                "stop_loss": np.nan if pd.isna(selected.stop_loss) else float(selected.stop_loss),
+                "stop_policy": selected.stop_policy,
+                "stop_cooldown_days": int(getattr(selected, "stop_cooldown_days", 0)),
                 **metrics,
                 **counts,
                 "trades": len(trades),
@@ -763,17 +775,72 @@ def independent_period_rows(
             })
     return rows
 
+
+def summarize_trade_file(path: Path) -> None:
+    print(f"\n{path}", flush=True)
+    if not path.exists():
+        print("파일이 없습니다. 먼저 python -u seedforge_007.py 를 끝까지 실행하세요.", flush=True)
+        return
+    trades = pd.read_json(path)
+    if trades.empty:
+        print("거래가 없습니다.", flush=True)
+        return
+    grouped = trades.groupby("exit_reason").agg(
+        count=("return", "size"),
+        avg_return=("return", "mean"),
+        win_rate=("return", lambda values: (values > 0).mean()),
+        avg_holding_days=("holding_days", "mean"),
+        avg_mae=("mae", "mean"),
+        avg_mfe=("mfe", "mean"),
+    )
+    print(grouped.to_string(float_format=lambda value: f"{value:,.4f}"), flush=True)
+    print("전체", flush=True)
+    print(
+        pd.Series(
+            {
+                "count": len(trades),
+                "avg_return": trades["return"].mean(),
+                "win_rate": (trades["return"] > 0).mean(),
+                "avg_holding_days": trades["holding_days"].mean(),
+                "avg_mae": trades["mae"].mean(),
+                "avg_mfe": trades["mfe"].mean(),
+            }
+        ).to_string(float_format=lambda value: f"{value:,.4f}"),
+        flush=True,
+    )
+
+
+def analyze_exits() -> None:
+    print("SeedForge 007 거래원장 청산사유 분석", flush=True)
+    output = D / "results"
+    for name in (
+        "trades_r35_w10_v1.0_rs0_nostop.json",
+        "trades_r35_w10_v1.0_rs0_stop30.json",
+        "trades_r35_w10_v1.0_rs0_stop30_cd252.json",
+    ):
+        summarize_trade_file(output / name)
+
+
 def main() -> None:
     started = perf_counter()
+    if "--analyze-exits" in sys.argv:
+        analyze_exits()
+        return
     refresh_cache = "--refresh-cache" in sys.argv
-    print("SeedForge 006 RSI 다이버전스 백테스트 시작", flush=True)
+    print("SeedForge 007 RSI 다이버전스 백테스트 시작", flush=True)
     market, features, overbought, neutral, kospi_close = load_or_prepare(refresh_cache)
     print(
         f"대상 {len(features):,}종목, 전처리/캐시 {perf_counter() - started:.1f}초, "
         "조합별 신호/시뮬레이션 시작",
         flush=True,
     )
-    print("RSI 대기 거래량 RS  손절   CAGR    MDD    노출   t(노출조정) 승률  손익비 거래PF 거래수 놓침")
+    stop_policies = (
+        ("nostop", None, 0),
+        ("stop30", -0.30, 0),
+        ("stop30_cd252", -0.30, 252),
+    )
+    total_combinations = 3 * 3 * 2 * 2 * len(stop_policies)
+    print("RSI 대기 거래량 RS  정책         CAGR    MDD    노출   t(노출조정) 승률  손익비 거래PF 거래수 놓침")
     output = D / "results"
     output.mkdir(parents=True, exist_ok=True)
     combination = 0
@@ -783,7 +850,7 @@ def main() -> None:
         for wait in (5, 10, 15):
             for volume_factor in (1.0, 1.2):
                 for use_rs in (False, True):
-                    for stop_loss in (None, -0.30):
+                    for stop_tag, stop_loss, stop_cooldown_days in stop_policies:
                         combination += 1
                         combination_started = perf_counter()
                         metrics, trades, equity, exposure, counts = run_one(
@@ -797,8 +864,8 @@ def main() -> None:
                             volume_factor,
                             use_rs,
                             stop_loss,
+                            stop_cooldown_days,
                         )
-                        stop_tag = "nostop" if stop_loss is None else "stop30"
                         tag = f"r{reentry}_w{wait}_v{volume_factor:.1f}_rs{int(use_rs)}_{stop_tag}"
                         trades.to_json(
                             output / f"trades_{tag}.json",
@@ -814,6 +881,8 @@ def main() -> None:
                             "volume_factor": volume_factor,
                             "use_relative_strength": use_rs,
                             "stop_loss": np.nan if stop_loss is None else stop_loss,
+                            "stop_policy": stop_tag,
+                            "stop_cooldown_days": stop_cooldown_days,
                             **metrics,
                             **counts,
                             "missed": missed,
@@ -822,8 +891,8 @@ def main() -> None:
                         summaries.append(row)
                         period_summaries.extend(period_rows(row, equity, exposure, kospi_close, trades))
                         print(
-                            f"[{combination:>2}/72] "
-                            f"{reentry:<3} {wait:<4} {volume_factor:<4.1f} {'O' if use_rs else '-':<2} {stop_tag:<6} "
+                            f"[{combination:>3}/{total_combinations}] "
+                            f"{reentry:<3} {wait:<4} {volume_factor:<4.1f} {'O' if use_rs else '-':<2} {stop_tag:<12} "
                             f"{metrics['cagr']:>7.2%} {metrics['mdd']:>7.1%} "
                             f"{metrics['exposure']:>6.1%} {metrics['t_exposure_matched']:>10.2f} "
                             f"{metrics['win_rate']:>5.1%} {metrics['payoff']:>6.2f} "
@@ -832,32 +901,40 @@ def main() -> None:
                             flush=True,
                         )
     summary = pd.DataFrame(summaries).sort_values("score", ascending=False)
-    summary.to_csv(output / "summary_seedforge_006.csv", index=False, encoding="utf-8-sig")
+    summary.to_csv(output / "summary_seedforge_007.csv", index=False, encoding="utf-8-sig")
     period_summary = pd.DataFrame(period_summaries)
-    period_summary.to_csv(output / "periods_seedforge_006.csv", index=False, encoding="utf-8-sig")
+    period_summary.to_csv(output / "periods_seedforge_007.csv", index=False, encoding="utf-8-sig")
     print("\n상위 5개 조합(점수순)", flush=True)
     for rank, row in enumerate(summary.head(5).itertuples(index=False), 1):
         print(
             f"#{rank} RSI {row.reentry_rsi} / 대기 {row.confirm_days} / "
             f"거래량 {row.volume_factor:.1f} / RS {'O' if row.use_relative_strength else '-'} / "
-            f"손절 {'없음' if pd.isna(row.stop_loss) else f'{row.stop_loss:.0%}'} | "
+            f"정책 {row.stop_policy} | "
             f"CAGR {row.cagr:.2%}, MDD {row.mdd:.1%}, PF {row.trade_pf:.2f}, "
             f"거래수 {row.filled}, 점수 {row.score:.2f}",
             flush=True,
         )
-    print(f"요약 저장: {output / 'summary_seedforge_006.csv'}", flush=True)
-    print(f"기간분리 저장: {output / 'periods_seedforge_006.csv'}", flush=True)
+    print(f"요약 저장: {output / 'summary_seedforge_007.csv'}", flush=True)
+    print(f"기간분리 저장: {output / 'periods_seedforge_007.csv'}", flush=True)
     independent = pd.DataFrame(
         independent_period_rows(summary, market, features, overbought, neutral, kospi_close)
     )
-    independent.to_csv(output / "walkforward_seedforge_006.csv", index=False, encoding="utf-8-sig")
-    print(f"독립 기간 재시뮬레이션 저장: {output / 'walkforward_seedforge_006.csv'}", flush=True)
+    independent.to_csv(output / "walkforward_seedforge_007.csv", index=False, encoding="utf-8-sig")
+    print(f"독립 기간 재시뮬레이션 저장: {output / 'walkforward_seedforge_007.csv'}", flush=True)
     best = summary.iloc[0]
+    same_stop = (
+        period_summary["stop_loss"].isna()
+        if pd.isna(best["stop_loss"])
+        else period_summary["stop_loss"].eq(best["stop_loss"])
+    )
+    same_cooldown = period_summary["stop_cooldown_days"].eq(best["stop_cooldown_days"])
     best_periods = period_summary.loc[
         (period_summary["reentry_rsi"] == best["reentry_rsi"])
         & (period_summary["confirm_days"] == best["confirm_days"])
         & (period_summary["volume_factor"] == best["volume_factor"])
         & (period_summary["use_relative_strength"] == best["use_relative_strength"])
+        & same_stop
+        & same_cooldown
     ]
     print("\n1위 조합 기간분리", flush=True)
     for row in best_periods.itertuples(index=False):
