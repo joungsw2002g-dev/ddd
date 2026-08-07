@@ -17,7 +17,7 @@ from seedforge_024_screen import month_ends
 
 
 RESULTS = Path("data/results")
-BUILD = "025.1-20260807"
+BUILD = "025.1.1-20260807"
 START = "2014-01-01"
 
 
@@ -42,10 +42,10 @@ def build_monthly_diagnostics(
     eligible: pd.DataFrame,
     kospi: pd.Series,
 ) -> pd.DataFrame:
-    dates = pd.DatetimeIndex(month_ends(close.loc[START:].index))
-    next_open = open_.shift(-1).reindex(dates)
+    signal_dates = pd.DatetimeIndex(month_ends(close.index))
+    next_open = open_.shift(-1).reindex(signal_dates)
     stock_returns = next_open.shift(-1) / next_open - 1
-    tradable = eligible.reindex(dates).fillna(False) & next_open.notna() & next_open.shift(-1).notna()
+    tradable = eligible.reindex(signal_dates).fillna(False) & next_open.notna() & next_open.shift(-1).notna()
     selected = stock_returns.where(tradable)
     equal_weight = selected.mean(axis=1)
     median_stock = selected.median(axis=1)
@@ -53,10 +53,15 @@ def build_monthly_diagnostics(
     positive = selected.clip(lower=0)
     top2 = np.sort(positive.fillna(0).to_numpy(), axis=1)[:, -2:].sum(axis=1)
     positive_sum = positive.sum(axis=1).replace(0, np.nan)
-    top2_positive_share = pd.Series(top2, index=dates) / positive_sum
-    kospi_monthly = kospi.reindex(dates).shift(-1) / kospi.reindex(dates) - 1
+    top2_positive_share = pd.Series(top2, index=signal_dates) / positive_sum
+    kospi_at_month_end = kospi.reindex(signal_dates)
+    kospi_monthly = kospi_at_month_end.shift(-1) / kospi_at_month_end - 1
+    # A return known at the following month-end belongs to that realized month.
+    # The previous build labeled it with the signal month, accidentally excluding
+    # January 2022 from the test period and producing a non-comparable CAGR.
+    realized_dates = pd.Series(signal_dates, index=signal_dates).shift(-1)
     report = pd.DataFrame({
-        "date": dates,
+        "date": realized_dates.to_numpy(),
         "kospi_return": kospi_monthly.to_numpy(),
         "equal_weight_return": equal_weight.to_numpy(),
         "median_stock_return": median_stock.to_numpy(),
@@ -65,7 +70,8 @@ def build_monthly_diagnostics(
         "tradable_stocks": selected.notna().sum(axis=1).to_numpy(),
     })
     report["kospi_minus_equal_weight"] = report["kospi_return"] - report["equal_weight_return"]
-    return report.dropna(subset=["kospi_return", "equal_weight_return"])
+    report = report.dropna(subset=["date", "kospi_return", "equal_weight_return"])
+    return report.loc[report["date"] >= START].reset_index(drop=True)
 
 
 def yearly_summary(monthly: pd.DataFrame) -> pd.DataFrame:
@@ -110,6 +116,13 @@ def main() -> None:
     if not test.empty:
         gap = float(test.iloc[0]["kospi_minus_equal_weight_cagr"])
         print(f"\n2022~2026 KOSPI-동일가중 CAGR 격차: {gap:.2%}p")
+        raw_test = kospi.loc["2022-01-01":].dropna()
+        years = (raw_test.index[-1] - raw_test.index[0]).days / 365.25
+        direct_cagr = float((raw_test.iloc[-1] / raw_test.iloc[0]) ** (1 / years) - 1)
+        monthly_cagr = float(test.iloc[0]["kospi_cagr"])
+        print(f"KOSPI 직접 CAGR 교차검증: {direct_cagr:.2%} (월수익 집계 {monthly_cagr:.2%})")
+        if abs(direct_cagr - monthly_cagr) > 0.01:
+            print("경고: KOSPI CAGR 차이가 1%p를 넘습니다. 월말/원본 지수 날짜를 확인하세요.")
     print(f"저장: {RESULTS / 'benchmark_monthly_seedforge_025.csv'}")
     print(f"저장: {RESULTS / 'benchmark_periods_seedforge_025.csv'}")
     print("다음 단계: 이 두 CSV를 확인한 뒤 025 확장 팩터 조합의 목표를 KOSPI/동일가중/잔차수익으로 분리합니다.")
