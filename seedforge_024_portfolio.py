@@ -15,6 +15,45 @@ RESULTS = Path("data/results")
 COMBOS = RESULTS / "factor_combos_seedforge_024.csv"
 SCREEN = RESULTS / "factor_screen_seedforge_024.csv"
 BUILD = "024.6-20260806"
+OBJECTIVE_EXCESS_CAGR = 0.05
+
+
+def benchmark_metrics(close: pd.Series, start: str = "2022-01-01") -> tuple[float, float]:
+    """Return buy-and-hold CAGR and MDD for the sealed test window."""
+    values = close.loc[start:].dropna().astype(float)
+    if len(values) < 2 or values.iloc[0] <= 0:
+        return float("nan"), float("nan")
+    years = max((values.index[-1] - values.index[0]).days / 365.25, 1 / 365.25)
+    cagr = float((values.iloc[-1] / values.iloc[0]) ** (1 / years) - 1)
+    mdd = float((values / values.cummax() - 1).min())
+    return cagr, mdd
+
+
+def add_objective_gates(summary: pd.DataFrame, kospi: pd.Series) -> pd.DataFrame:
+    """Apply the pre-registered return/risk hurdle; an MDD pass alone is not approval."""
+    result = summary.copy()
+    benchmark_cagr, benchmark_mdd = benchmark_metrics(kospi)
+    test_cagr = result["cagr_test_2022_2026"].fillna(-1.0)
+    test_mdd = result["mdd_test_2022_2026"].fillna(-1.0)
+    test_pf = result["trade_pf_test_2022_2026"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    test_trades = result["period_trades_test_2022_2026"].fillna(0).astype(int)
+    strategy_calmar = test_cagr.clip(lower=0) / test_mdd.abs().replace(0, np.nan)
+    benchmark_calmar = max(benchmark_cagr, 0) / abs(benchmark_mdd) if benchmark_mdd < 0 else np.nan
+    result["kospi_cagr_test_2022_2026"] = benchmark_cagr
+    result["kospi_mdd_test_2022_2026"] = benchmark_mdd
+    result["excess_cagr_test_2022_2026"] = test_cagr - benchmark_cagr
+    result["calmar_test_2022_2026"] = strategy_calmar
+    result["kospi_calmar_test_2022_2026"] = benchmark_calmar
+    result["passes_return_gate"] = result["excess_cagr_test_2022_2026"] >= OBJECTIVE_EXCESS_CAGR
+    result["passes_quality_gate"] = (test_pf >= 1.3) & (test_trades >= 50)
+    result["passes_calmar_gate"] = strategy_calmar >= benchmark_calmar * 1.25
+    result["passes_objective_gate_at_base_cost"] = (
+        result["passes_mdd_gate"]
+        & result["passes_return_gate"]
+        & result["passes_quality_gate"]
+        & result["passes_calmar_gate"]
+    )
+    return result
 
 
 def build_signals(
@@ -93,17 +132,36 @@ def main() -> None:
                 f"차단 {signal_diagnostics['blocked_months']}"
             )
 
-    summary = core.add_validation_scores(pd.DataFrame(summaries), pd.DataFrame(periods)).sort_values("robust_score", ascending=False)
+    summary = core.add_validation_scores(pd.DataFrame(summaries), pd.DataFrame(periods))
+    summary = add_objective_gates(summary, kospi).sort_values(
+        ["passes_objective_gate_at_base_cost", "robust_score"], ascending=[False, False]
+    )
     summary.to_csv(RESULTS / "summary_seedforge_024_portfolio.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(periods).to_csv(RESULTS / "periods_seedforge_024_portfolio.csv", index=False, encoding="utf-8-sig")
     columns = ["factor_combo", "market_policy", "cagr", "mdd", "trade_pf", "cagr_test_2022_2026",
-               "mdd_test_2022_2026", "trade_pf_test_2022_2026", "robust_score", "passes_mdd_gate"]
-    print("\nRSI 포트폴리오 상위 후보")
+               "kospi_cagr_test_2022_2026", "excess_cagr_test_2022_2026", "mdd_test_2022_2026",
+               "trade_pf_test_2022_2026", "robust_score", "passes_mdd_gate",
+               "passes_objective_gate_at_base_cost"]
+    passed = summary.loc[summary["passes_objective_gate_at_base_cost"]]
+    decision = "PASS" if not passed.empty else "FAIL"
+    pd.DataFrame([{
+        "decision": decision,
+        "reason": "objective gate passed; run 1.0% cost stress before live approval" if decision == "PASS"
+                  else "no candidate beat test KOSPI by 5%p with all risk/quality gates",
+        "candidates": len(summary), "passing_candidates": len(passed),
+    }]).to_csv(RESULTS / "decision_seedforge_024.csv", index=False, encoding="utf-8-sig")
+    print("\nRSI 포트폴리오 결과(실전 허들 우선)")
     print(summary[columns].head(10).to_string(index=False))
+    print(f"\n최종판정: {decision}")
+    if decision == "FAIL":
+        print("MDD게이트 통과는 매매 승인이 아닙니다. test KOSPI 대비 +5%p 허들을 통과한 후보가 없습니다.")
+    else:
+        print("기본비용 허들 통과 후보가 있습니다. 1.0% 왕복비용 스트레스 전에는 실전 승인하지 않습니다.")
     regime_rows = summary.loc[summary["market_policy"].eq("kospi_ma200")]
     if not regime_rows.empty and int(regime_rows["blocked_months"].max()) == 0:
         print("경고: KOSPI MA200 차단 월이 0개입니다. KOSPI 데이터/날짜 정렬을 확인하세요.")
     print(f"저장: {RESULTS / 'summary_seedforge_024_portfolio.csv'}")
+    print(f"판정 저장: {RESULTS / 'decision_seedforge_024.csv'}")
 
 
 if __name__ == "__main__":
