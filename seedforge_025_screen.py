@@ -20,13 +20,41 @@ ROUNDTRIP_COST = 0.01
 def expanded_factor_builders(
     close: pd.DataFrame, open_: pd.DataFrame, volume: pd.DataFrame
 ) -> dict[str, tuple[str, Callable[[], pd.DataFrame]]]:
-    ret = close.pct_change(fill_method=None)
-    value = close * volume
-    ma = {n: close.rolling(n).mean() for n in (20, 60, 120, 200, 252)}
-    std = {n: ret.rolling(n).std() for n in (20, 60, 120, 252)}
-    downside = ret.clip(upper=0)
-    rsi = core.rsi_frame(close)
-    macd = ema(close, 12) - ema(close, 26)
+    # Do not eagerly materialize every daily rolling matrix here.  A single
+    # 3,000-stock matrix is tens of MiB and keeping all MA/std/RSI intermediates
+    # alive can exhaust ordinary Windows machines before the first factor is
+    # consumed.  Builders intentionally compute one factor at a time so the
+    # caller can convert it to the compact monthly array and release it.
+    def returns() -> pd.DataFrame:
+        return close.pct_change(fill_method=None)
+
+    def moving_average(window: int) -> pd.DataFrame:
+        return close.rolling(window).mean()
+
+    def moving_average_slope(window: int) -> pd.DataFrame:
+        average = moving_average(window)
+        return average / average.shift(20) - 1
+
+    def moving_average_alignment() -> pd.DataFrame:
+        previous = moving_average(20)
+        result = close.gt(previous).astype(np.float32)
+        for window in (60, 120, 200):
+            current = moving_average(window)
+            result += previous.gt(current).to_numpy(dtype=np.float32)
+            previous = current
+        return result
+
+    def low_volatility(window: int) -> pd.DataFrame:
+        return -returns().rolling(window).std()
+
+    def downside_volatility(window: int) -> pd.DataFrame:
+        return -returns().clip(upper=0).rolling(window).std()
+
+    def traded_value() -> pd.DataFrame:
+        return close * volume
+
+    def macd_frame() -> pd.DataFrame:
+        return ema(close, 12) - ema(close, 26)
     builders: dict[str, tuple[str, Callable[[], pd.DataFrame]]] = {
         "M01_ret20": ("momentum", lambda: close.pct_change(20, fill_method=None)),
         "M02_ret60": ("momentum", lambda: close.pct_change(60, fill_method=None)),
@@ -36,49 +64,49 @@ def expanded_factor_builders(
         "M06_ret12m_skip1m": ("momentum", lambda: close.shift(20) / close.shift(252) - 1),
         "M07_multi_horizon": ("momentum", lambda: sum(close.pct_change(n, fill_method=None).rank(axis=1, pct=True) for n in (20, 60, 120, 252)) / 4),
         "M08_momentum_accel": ("momentum", lambda: close.pct_change(60, fill_method=None) - close.pct_change(120, fill_method=None) / 2),
-        "T01_ma20_distance": ("trend", lambda: close / ma[20] - 1),
-        "T02_ma60_distance": ("trend", lambda: close / ma[60] - 1),
-        "T03_ma120_distance": ("trend", lambda: close / ma[120] - 1),
-        "T04_ma200_distance": ("trend", lambda: close / ma[200] - 1),
-        "T05_ma60_slope": ("trend", lambda: ma[60] / ma[60].shift(20) - 1),
-        "T06_ma200_slope": ("trend", lambda: ma[200] / ma[200].shift(20) - 1),
-        "T07_ma_alignment": ("trend", lambda: close.gt(ma[20]).astype(float) + ma[20].gt(ma[60]) + ma[60].gt(ma[120]) + ma[120].gt(ma[200])),
+        "T01_ma20_distance": ("trend", lambda: close / moving_average(20) - 1),
+        "T02_ma60_distance": ("trend", lambda: close / moving_average(60) - 1),
+        "T03_ma120_distance": ("trend", lambda: close / moving_average(120) - 1),
+        "T04_ma200_distance": ("trend", lambda: close / moving_average(200) - 1),
+        "T05_ma60_slope": ("trend", lambda: moving_average_slope(60)),
+        "T06_ma200_slope": ("trend", lambda: moving_average_slope(200)),
+        "T07_ma_alignment": ("trend", moving_average_alignment),
         "T08_ema_spread": ("trend", lambda: ema(close, 20) / ema(close, 60) - 1),
         "T09_breakout20": ("trend", lambda: close / close.rolling(20).max().shift(1) - 1),
         "T10_breakout60": ("trend", lambda: close / close.rolling(60).max().shift(1) - 1),
         "T11_near_high252": ("trend", lambda: close / close.rolling(252).max()),
         "T12_efficiency20": ("trend", lambda: close.diff(20) / close.diff().abs().rolling(20).sum()),
         "T13_efficiency60": ("trend", lambda: close.diff(60) / close.diff().abs().rolling(60).sum()),
-        "R01_low_vol20": ("risk", lambda: -std[20]),
-        "R02_low_vol60": ("risk", lambda: -std[60]),
-        "R03_low_vol252": ("risk", lambda: -std[252]),
-        "R04_downside_vol60": ("risk", lambda: -downside.rolling(60).std()),
-        "R05_downside_vol252": ("risk", lambda: -downside.rolling(252).std()),
-        "R06_max_loss20": ("risk", lambda: ret.rolling(20).min()),
-        "R07_max_loss60": ("risk", lambda: ret.rolling(60).min()),
+        "R01_low_vol20": ("risk", lambda: low_volatility(20)),
+        "R02_low_vol60": ("risk", lambda: low_volatility(60)),
+        "R03_low_vol252": ("risk", lambda: low_volatility(252)),
+        "R04_downside_vol60": ("risk", lambda: downside_volatility(60)),
+        "R05_downside_vol252": ("risk", lambda: downside_volatility(252)),
+        "R06_max_loss20": ("risk", lambda: returns().rolling(20).min()),
+        "R07_max_loss60": ("risk", lambda: returns().rolling(60).min()),
         "R08_drawdown252": ("risk", lambda: close / close.rolling(252).max() - 1),
         "R09_ulcer60": ("risk", lambda: -(close / close.rolling(60).max() - 1).pow(2).rolling(60).mean().pow(0.5)),
-        "R10_skew60": ("risk", lambda: ret.rolling(60).skew()),
-        "V01_value20": ("volume", lambda: value.rolling(20).mean()),
-        "V02_value252": ("volume", lambda: value.rolling(252).mean()),
-        "V03_value_growth": ("volume", lambda: value.rolling(20).mean() / value.rolling(120).mean() - 1),
+        "R10_skew60": ("risk", lambda: returns().rolling(60).skew()),
+        "V01_value20": ("volume", lambda: traded_value().rolling(20).mean()),
+        "V02_value252": ("volume", lambda: traded_value().rolling(252).mean()),
+        "V03_value_growth": ("volume", lambda: traded_value().rolling(20).mean() / traded_value().rolling(120).mean() - 1),
         "V04_relative_volume": ("volume", lambda: volume.rolling(5).mean() / volume.rolling(60).mean() - 1),
-        "V05_vwma20_spread": ("volume", lambda: close.mul(volume).rolling(20).sum() / volume.rolling(20).sum() / ma[20] - 1),
-        "V06_vwma60_spread": ("volume", lambda: close.mul(volume).rolling(60).sum() / volume.rolling(60).sum() / ma[60] - 1),
-        "V07_amihud20": ("volume", lambda: -(ret.abs() / value.replace(0, np.nan)).rolling(20).mean()),
-        "V08_up_volume_ratio": ("volume", lambda: volume.where(ret > 0, 0).rolling(20).sum() / volume.rolling(20).sum()),
-        "O01_rsi": ("oscillator", lambda: rsi - 50),
-        "O02_rsi_change": ("oscillator", lambda: rsi.diff(10)),
-        "O03_macd_spread": ("oscillator", lambda: macd / close),
-        "O04_macd_histogram": ("oscillator", lambda: (macd - ema(macd, 9)) / close),
+        "V05_vwma20_spread": ("volume", lambda: close.mul(volume).rolling(20).sum() / volume.rolling(20).sum() / moving_average(20) - 1),
+        "V06_vwma60_spread": ("volume", lambda: close.mul(volume).rolling(60).sum() / volume.rolling(60).sum() / moving_average(60) - 1),
+        "V07_amihud20": ("volume", lambda: -(returns().abs() / traded_value().replace(0, np.nan)).rolling(20).mean()),
+        "V08_up_volume_ratio": ("volume", lambda: volume.where(returns() > 0, 0).rolling(20).sum() / volume.rolling(20).sum()),
+        "O01_rsi": ("oscillator", lambda: core.rsi_frame(close) - 50),
+        "O02_rsi_change": ("oscillator", lambda: core.rsi_frame(close).diff(10)),
+        "O03_macd_spread": ("oscillator", lambda: macd_frame() / close),
+        "O04_macd_histogram": ("oscillator", lambda: (lambda macd: (macd - ema(macd, 9)) / close)(macd_frame())),
         "O05_roc_accel": ("oscillator", lambda: close.pct_change(20, fill_method=None) - close.pct_change(60, fill_method=None) / 3),
         "O06_reversal5": ("oscillator", lambda: -close.pct_change(5, fill_method=None)),
         "O07_reversal20": ("oscillator", lambda: -close.pct_change(20, fill_method=None)),
         "O08_coppock_proxy": ("oscillator", lambda: (close.pct_change(252, fill_method=None) + close.pct_change(120, fill_method=None)).rolling(10).mean()),
         "P01_gap_risk20": ("price_action", lambda: -(open_ / close.shift(1) - 1).rolling(20).std()),
         "P02_gap_risk60": ("price_action", lambda: -(open_ / close.shift(1) - 1).rolling(60).std()),
-        "P03_positive_days20": ("price_action", lambda: ret.gt(0).rolling(20).mean()),
-        "P04_positive_days60": ("price_action", lambda: ret.gt(0).rolling(60).mean()),
+        "P03_positive_days20": ("price_action", lambda: returns().gt(0).rolling(20).mean()),
+        "P04_positive_days60": ("price_action", lambda: returns().gt(0).rolling(60).mean()),
         "P05_close_open_strength": ("price_action", lambda: (close / open_ - 1).rolling(20).mean()),
     }
     return builders
