@@ -178,6 +178,7 @@ def build_factor_library(
     volume: pd.DataFrame,
     dates: pd.DatetimeIndex,
     flows: dict[str, pd.DataFrame],
+    required_factors: set[str] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     arrays: dict[str, np.ndarray] = {}
     groups: dict[str, str] = {}
@@ -185,6 +186,8 @@ def build_factor_library(
     technical = expanded_factor_builders(close, open_, volume)
     print(f"기술 팩터 {len(technical)}개 준비 중...")
     for number, (name, (group, builder)) in enumerate(technical.items(), 1):
+        if required_factors is not None and name not in required_factors:
+            continue
         monthly = asof_daily_matrix(builder(), dates)
         arrays[name] = rank_array(monthly)
         groups[name] = group
@@ -196,6 +199,8 @@ def build_factor_library(
     flow_factors = build_factors(flows, close, volume)
     print(f"수급 팩터 {len(flow_factors)}개 준비 중...")
     for name, frame in flow_factors.items():
+        if required_factors is not None and name not in required_factors:
+            continue
         arrays[name] = rank_array(frame.reindex(dates))
         groups[name] = "flow"
 
@@ -207,6 +212,8 @@ def build_factor_library(
         dart_columns = dart_factor_columns(events)
         print(f"DART 팩터 {len(dart_columns)}개 준비 중...")
         for name, values in dart_columns.items():
+            if required_factors is not None and name not in required_factors:
+                continue
             matrix = point_in_time_matrix(events, values, dates, close.columns)
             arrays[name] = rank_array(matrix)
             groups[name] = "dart"
